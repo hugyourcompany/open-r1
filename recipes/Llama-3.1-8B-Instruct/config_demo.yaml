@@ -1,0 +1,66 @@
+# Model arguments
+model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: sdpa
+use_peft: true                # <--- ADICIONE ESTA LINHA
+lora_r: 16                    # <--- ADICIONE ESTA LINHA
+lora_alpha: 32                # <--- ADICIONE ESTA LINHA
+lora_dropout: 0.05            # <--- ADICIONE ESTA LINHA
+
+# Data training arguments
+dataset_name: LisandraMoura/API_gen_mt5k_fit_with_feedback
+dataset_prompt_column: problem
+system_prompt: "You are a helpful AI Assistant that provides well-reasoned responses and makes appropriate tool calls. You first think about the reasoning process as an internal monologue and then provide the tool call in the specified format. Respond in the following format: <think>\n...\n</think>\n<answer>\n{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\", \"param2\": \"value2\"}}\n</answer>"
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_server_base_url: "http://vllm-server:8000"
+# vLLM specific configurations
+enforce_eager: true
+do_eval: false
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+hub_model_id: Llama-3.1-8B-Open-R1-GRPO
+hub_strategy: every_save
+learning_rate: 2.0e-05
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine
+max_prompt_length: 512
+max_completion_length: 1024
+max_steps: -1
+num_generations: 256  
+num_train_epochs: 1
+output_dir: data/Llama-3.1-8B-Open-R1-GRPO
+overwrite_output_dir: true
+per_device_eval_batch_size: 256
+per_device_train_batch_size: 256 
+push_to_hub: true
+report_to:
+- wandb
+# reward_funcs:
+# - accuracy
+# - format
+# - tag_count
+
+reward_funcs:
+- tool_call_accuracy
+- tool_call_format
+- tag_count
+
+# Mantenha as outras configurações como estão
+reward_weights:
+- 1.0
+- 1.0
+- 1.0
+save_strategy: "epoch"
+save_total_limit: 1
+seed: 42
+warmup_ratio: 0.1
