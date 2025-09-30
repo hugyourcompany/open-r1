@@ -84,7 +84,9 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
+    # pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
+    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?{.*?\"name\".*?\"arguments\".*?}.*?\n</answer>$"
+
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
@@ -643,9 +645,20 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
     return soft_overlong_punishment_reward
 
 
+def tool_call_format_reward(completions, **kwargs):
+    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, 
+    while the final answer contains a valid JSON tool call within <answer> and </answer> tags."""
+    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\{.*?\"name\".*?\"arguments\".*?\}.*?\n</answer>$"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    return [1.0 if match else 0.0 for match in matches]
+
+
 def get_reward_funcs(script_args) -> list[Callable]:
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
+        "tool_call_accuracy": tool_call_accuracy_reward,
+        "tool_call_format": tool_call_format_reward,
         "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
@@ -704,3 +717,135 @@ def get_reward_funcs(script_args) -> list[Callable]:
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     return reward_funcs
+
+
+def extract_json_from_text(text: str) -> dict:
+    """Extract JSON object from text using regex."""
+    import re
+    
+    # Look for JSON pattern in the text
+    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+    matches = re.findall(json_pattern, text)
+    
+    for match in matches:
+        try:
+            parsed = json.loads(match)
+            # Check if it looks like a tool call (has "name" field)
+            if isinstance(parsed, dict) and "name" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    
+    return {}
+
+
+def calculate_tool_call_similarity(completion_tool: dict, gold_tool: dict) -> float:
+    """Calculate similarity between tool calls with partial scoring."""
+    if not completion_tool or not gold_tool:
+        return 0.0
+    
+    total_score = 0.0
+    
+    # Score for tool name (40% of total score)
+    name_weight = 0.4
+    if completion_tool.get("name") == gold_tool.get("name"):
+        total_score += name_weight
+    else:
+        # Give partial credit for related tool names
+        completion_name = completion_tool.get("name", "")
+        gold_name = gold_tool.get("name", "")
+        if "find_user_id" in completion_name and "find_user_id" in gold_name:
+            total_score += name_weight * 0.3  # 30% for related function
+    
+    # Score for arguments (60% of total score)
+    args_weight = 0.6
+    gold_args = gold_tool.get("arguments", {})
+    completion_args = completion_tool.get("arguments", {})
+    
+    if not gold_args:
+        # If no arguments expected, perfect score if no arguments provided
+        total_score += args_weight if not completion_args else 0.0
+    else:
+        # Calculate argument similarity with cross-field matching
+        arg_score = 0.0
+        total_possible_matches = len(gold_args)
+        
+        # Direct field matching
+        for key, expected_value in gold_args.items():
+            if key in completion_args:
+                actual_value = completion_args[key]
+                if actual_value == expected_value:
+                    arg_score += 1.0
+                elif isinstance(actual_value, str) and isinstance(expected_value, str):
+                    # String similarity
+                    if actual_value.lower().strip() == expected_value.lower().strip():
+                        arg_score += 0.9
+                    elif expected_value.lower() in actual_value.lower() or actual_value.lower() in expected_value.lower():
+                        arg_score += 0.5
+        
+        # Cross-field semantic matching (for different tool types)
+        if arg_score == 0.0 and completion_args and gold_args:
+            # Check if values appear in different fields (e.g., name in email)
+            semantic_matches = 0
+            for gold_key, gold_value in gold_args.items():
+                for comp_key, comp_value in completion_args.items():
+                    if isinstance(gold_value, str) and isinstance(comp_value, str):
+                        gold_val_lower = gold_value.lower().strip()
+                        comp_val_lower = comp_value.lower().strip()
+                        
+                        # Check if name appears in email or vice versa
+                        if (gold_val_lower in comp_val_lower or comp_val_lower in gold_val_lower) and len(gold_val_lower) > 2:
+                            semantic_matches += 0.3  # Partial credit for semantic similarity
+                            break
+            
+            arg_score = min(semantic_matches, 1.0)
+        
+        final_arg_score = arg_score / total_possible_matches if total_possible_matches > 0 else 1.0
+        total_score += args_weight * final_arg_score
+    
+    return min(total_score, 1.0)  # Ensure score doesn't exceed 1.0
+
+
+def tool_call_accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
+    """Reward function that checks similarity between completion and expected tool call.
+    
+    Returns similarity score from 0.0 to 1.0:
+    - 1.0: Perfect match (100%)
+    - 0.9: Almost perfect (90%)
+    - 0.5: Partial match (50%)
+    - 0.0: No match
+    """
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    
+    for content, sol in zip(contents, solution):
+        try:
+            # Parse the expected solution (gold)
+            gold_tool_call = json.loads(sol)
+            
+            # Extract tool call from completion text
+            completion_tool_call = extract_json_from_text(content)
+            
+            if not completion_tool_call:
+                print(f"No valid JSON tool call found in completion: {content[:100]}...")
+                rewards.append(0.0)
+                continue
+            
+            # Calculate similarity score
+            similarity = calculate_tool_call_similarity(completion_tool_call, gold_tool_call)
+            rewards.append(similarity)
+            
+            # Debug logging
+            if similarity < 1.0:
+                print(f"Partial match (score: {similarity:.2f})")
+                print(f"Expected: {gold_tool_call}")
+                print(f"Got: {completion_tool_call}")
+                
+        except json.JSONDecodeError as e:
+            print(f"Error parsing gold solution JSON: {e}, solution: {sol}")
+            rewards.append(0.0)
+        except Exception as e:
+            print(f"Error processing tool call: {e}")
+            rewards.append(0.0)
+            
+    return rewards
